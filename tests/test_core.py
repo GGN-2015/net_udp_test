@@ -1,0 +1,183 @@
+import math
+import socket
+import threading
+import time
+from dataclasses import replace
+
+import pytest
+
+from udp_probe.config import ProbeConfig
+from udp_probe.metrics import PacketTracker, RateSearch, evaluate_trial
+from udp_probe.protocol import JsonChannel, ProtocolError
+from udp_probe.udp import HEADER, MAGIC, UdpEndpoint
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"host_udp_port": 80},
+        {"phone_udp_port": 65536},
+        {"payload_size": 1401},
+        {"duration": 0.1},
+        {"start_mbps": math.nan},
+        {"max_mbps": math.inf},
+        {"min_mbps": 20},
+        {"loss_limit": -1},
+        {"max_steps": 0},
+        {"direction": "invalid"},
+        {"mode": "invalid"},
+        {"host_udp_port": 5002.0},
+        {"drain_ms": True},
+        {"tolerance": 0},
+    ],
+)
+def test_config_rejects_invalid_values(changes):
+    with pytest.raises(ValueError):
+        replace(ProbeConfig(), **changes).validate()
+
+
+def test_search_brackets_and_converges():
+    search = RateSearch(replace(ProbeConfig(), start_mbps=10, max_mbps=100, max_steps=30))
+    rates = []
+    while True:
+        rates.append(search.current)
+        if search.observe(search.current <= 35) is None:
+            break
+    assert rates[:3] == [10, 20, 40]
+    assert 33.25 <= search.low <= 35
+    assert search.high > 35
+    assert len(rates) <= 30
+
+
+@pytest.mark.parametrize("passed,expected", [(True, 200), (False, None)])
+def test_search_stops_at_limits(passed, expected):
+    search = RateSearch(replace(ProbeConfig(), max_steps=30))
+    for _ in range(30):
+        if search.observe(passed) is None:
+            break
+    assert search.low == expected
+    assert search.current == (200 if passed else 1)
+
+
+def test_tracking_deduplicates_and_counts_reordering():
+    tracker = PacketTracker(8)
+    tracker.record(0, 100, 1000)
+    tracker.record(2, 200, 1200)
+    tracker.record(1, 150, 1300)
+    tracker.record(1, 150, 1400)
+    tracker.record(8, 300, 1500)
+    tracker.record(-1, 300, 1600)
+    result = tracker.snapshot()
+    assert result["received"] == 3
+    assert result["duplicates"] == 1
+    assert result["reordered"] == 1
+    assert result["jitter_ms"] > 0
+
+
+def report(received=100):
+    return {"received": received, "duplicates": 0, "reordered": 0, "jitter_ms": 0.1}
+
+
+def test_measurement_distinguishes_loss_and_sender_limit():
+    sender = {"sent": 100, "elapsed": 1, "errors": 0}
+    assert evaluate_trial(sender, report(), 0.96, 1200, 1)["status"] == "PASS"
+    assert evaluate_trial(sender, report(98), 0.96, 1200, 1)["status"] == "LOSS"
+    limited = evaluate_trial(sender, report(), 10, 1200, 1)
+    assert limited["status"] == "SENDER LIMITED"
+    assert limited["goodput_mbps"] == 0.96
+    assert evaluate_trial(sender, report(99), 0.96, 1200, 1)["passed"]
+
+
+def test_zero_packets_and_invalid_remote_metrics():
+    assert not evaluate_trial({"sent": 0, "elapsed": 1, "errors": 0}, report(0), 1, 1200, 1)[
+        "passed"
+    ]
+    with pytest.raises(ValueError):
+        evaluate_trial({"sent": 5, "elapsed": 1, "errors": 0}, report(6), 1, 1200, 1)
+    with pytest.raises(ValueError):
+        evaluate_trial(
+            {"sent": 100, "elapsed": 1, "errors": 0},
+            {**report(), "jitter_ms": math.nan},
+            1,
+            1200,
+            1,
+        )
+
+
+def tcp_pair():
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        client = socket.create_connection(listener.getsockname())
+        connection, _ = listener.accept()
+        return client, connection
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [b"[]\n", b"{broken\n", b'{"type": 3}\n', b"x" * 65537],
+    ids=["array", "invalid-json", "invalid-type", "oversized"],
+)
+def test_control_rejects_invalid_frames(raw):
+    client, connection = tcp_pair()
+    channel = JsonChannel(connection)
+    try:
+        client.sendall(raw)
+        with pytest.raises(ProtocolError):
+            channel.receive()
+    finally:
+        channel.close()
+        channel.finish_reader()
+        client.close()
+
+
+def test_control_handles_split_and_combined_frames():
+    client, connection = tcp_pair()
+    channel = JsonChannel(connection)
+    try:
+        client.sendall(b'{"type":"he')
+        client.sendall(b'llo"}\n{"type":"ping"}\n')
+        assert channel.receive()["type"] == "hello"
+        assert channel.receive()["type"] == "ping"
+    finally:
+        channel.close()
+        channel.finish_reader()
+        client.close()
+
+
+def test_udp_rejects_foreign_session_trial_and_counts_duplicates():
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+        sender.bind(("127.0.0.1", 0))
+        endpoint = UdpEndpoint("127.0.0.1", 0, "127.0.0.1", sender.getsockname()[1], 123)
+        try:
+            endpoint.begin(456, 1, 1, 128)
+            target = endpoint.socket.getsockname()
+            for session, trial, sequence in [
+                (0, 456, 0),
+                (123, 0, 0),
+                (123, 456, 0),
+                (123, 456, 2),
+                (123, 456, 1),
+                (123, 456, 1),
+            ]:
+                packet = HEADER.pack(MAGIC, 1, session, trial, sequence, time.monotonic_ns())
+                sender.sendto(packet + bytes(128 - HEADER.size), target)
+            time.sleep(0.15)
+            assert endpoint.snapshot()["received"] == 3
+            assert endpoint.snapshot()["duplicates"] == 1
+            assert endpoint.snapshot()["reordered"] == 1
+        finally:
+            endpoint.close()
+
+
+def test_sender_cancel_is_prompt():
+    endpoint = UdpEndpoint("127.0.0.1", 0, "127.0.0.1", 9, 1)
+    cancel = threading.Event()
+    cancel.set()
+    try:
+        started = time.monotonic()
+        result = endpoint.send(1, 1, 10, 1200, cancel)
+        assert result["sent"] == 0
+        assert time.monotonic() - started < 0.5
+    finally:
+        endpoint.close()
