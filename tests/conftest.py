@@ -20,7 +20,7 @@ class EventLog:
     def emit(self, kind, data):
         self.events.put((kind, data))
 
-    def wait(self, expected, timeout=12):
+    def wait(self, expected, timeout=30):
         deadline = time.monotonic() + timeout
         seen = []
         while time.monotonic() < deadline:

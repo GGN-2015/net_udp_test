@@ -6,7 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from test_integration import configuration
+from test_integration import assert_complete_groups, configuration
 
 
 @pytest.fixture(scope="module")
@@ -70,6 +70,7 @@ def test_actual_android_core_bidirectional_and_repeat(host, java_phone):
         assert result["outcome"] == "completed", result
         assert len(result["records"]) == 2
         assert all(record["passed"] for record in result["records"]), result
+        assert_complete_groups(result)
 
 
 def test_actual_android_core_stop_restart_and_verify(host, java_phone):
@@ -85,3 +86,4 @@ def test_actual_android_core_stop_restart_and_verify(host, java_phone):
     result = events.wait("finished")
     assert result["outcome"] == "completed", result
     assert result["recommendations"]["downlink"]["passed"], result
+    assert_complete_groups(result)

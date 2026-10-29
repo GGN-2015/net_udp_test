@@ -6,7 +6,8 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from .metrics import RateSearch, evaluate_trial
+from .config import TRIALS_PER_RATE
+from .metrics import RateSearch, aggregate_trials, evaluate_trial
 from .protocol import VERSION, JsonChannel, ProtocolError
 from .udp import UdpEndpoint
 
@@ -183,14 +184,23 @@ class HostServer:
                 return message
         raise TimeoutError(f"Timed out waiting for {kind}; check UDP ports and phone status.")
 
-    def _trial(self, peer, endpoint, config, direction, rate, phase, records):
+    def _trial(self, peer, endpoint, config, direction, rate, phase, group, repetition):
         if self.cancel.is_set():
             raise ProbeCancelled()
         trial = secrets.randbits(63) or 1
         duration = min(30, max(3, config.duration * 1.5)) if phase == "verify" else config.duration
         endpoint.begin(trial, rate, duration, config.payload_size)
         self.emit(
-            "trial", {"direction": direction, "rate": rate, "phase": phase, "duration": duration}
+            "trial",
+            {
+                "direction": direction,
+                "rate": rate,
+                "phase": phase,
+                "duration": duration,
+                "group": group,
+                "repetition": repetition,
+                "repetitions": TRIALS_PER_RATE,
+            },
         )
         peer.channel.send(
             {
@@ -201,6 +211,9 @@ class HostServer:
                 "target_mbps": rate,
                 "duration": duration,
                 "phase": phase,
+                "group": group,
+                "repetition": repetition,
+                "repetitions": TRIALS_PER_RATE,
             }
         )
         self._wait(peer, "trial_ready", 5, trial)
@@ -217,7 +230,25 @@ class HostServer:
                 raise ProbeCancelled()
             receiver = endpoint.snapshot()
         result = evaluate_trial(sender, receiver, rate, config.payload_size, config.loss_limit)
-        result.update({"direction": direction, "phase": phase, "trial": trial})
+        result.update(
+            direction=direction,
+            phase=phase,
+            trial=trial,
+            group=group,
+            repetition=repetition,
+            repetitions=TRIALS_PER_RATE,
+        )
+        return result
+
+    def _rate_test(self, peer, endpoint, config, direction, rate, phase, records, samples):
+        group = secrets.randbits(63) or 1
+        group_samples = []
+        for repetition in range(1, TRIALS_PER_RATE + 1):
+            sample = self._trial(peer, endpoint, config, direction, rate, phase, group, repetition)
+            samples.append(sample)
+            group_samples.append(sample)
+            self.emit("sample", sample)
+        result = aggregate_trials(group_samples)
         records.append(result)
         self.emit("result", result)
         peer.channel.send({"type": "result", "run": self.run_id, **result})
@@ -226,6 +257,7 @@ class HostServer:
     def _run(self, peer, config):
         endpoint = None
         records = []
+        samples = []
         recommendations = {}
         outcome = "completed"
         self.emit("running", {"config": config.to_dict(), "peer": peer.address[0]})
@@ -244,15 +276,29 @@ class HostServer:
             )
             for direction in directions:
                 if config.mode == "fixed":
-                    self._trial(
-                        peer, endpoint, config, direction, config.start_mbps, "fixed", records
+                    self._rate_test(
+                        peer,
+                        endpoint,
+                        config,
+                        direction,
+                        config.start_mbps,
+                        "fixed",
+                        records,
+                        samples,
                     )
                     continue
                 search = RateSearch(config)
                 candidates = []
                 while True:
-                    result = self._trial(
-                        peer, endpoint, config, direction, search.current, "search", records
+                    result = self._rate_test(
+                        peer,
+                        endpoint,
+                        config,
+                        direction,
+                        search.current,
+                        "search",
+                        records,
+                        samples,
                     )
                     if result["passed"]:
                         candidates.append(result["target_mbps"])
@@ -260,8 +306,8 @@ class HostServer:
                         break
                 recommendations[direction] = None
                 for rate in sorted(candidates, reverse=True)[:3]:
-                    confirmed = self._trial(
-                        peer, endpoint, config, direction, rate, "verify", records
+                    confirmed = self._rate_test(
+                        peer, endpoint, config, direction, rate, "verify", records, samples
                     )
                     if confirmed["passed"]:
                         recommendations[direction] = confirmed
@@ -298,6 +344,8 @@ class HostServer:
                 {
                     "outcome": outcome,
                     "records": records,
+                    "samples": samples,
+                    "repetitions_per_rate": TRIALS_PER_RATE,
                     "recommendations": recommendations,
                     "config": config.to_dict(),
                     "peer": peer.address[0],

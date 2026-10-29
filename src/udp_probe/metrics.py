@@ -1,4 +1,7 @@
 import math
+from statistics import median
+
+from .config import LOSS_FAILURE_PERCENT, TRIALS_PER_RATE
 
 
 class RateSearch:
@@ -106,3 +109,29 @@ def evaluate_trial(sender, receiver, target_mbps, payload_size, loss_limit):
         "status": status,
         "passed": status == "PASS",
     }
+
+
+def aggregate_trials(samples):
+    if len(samples) != TRIALS_PER_RATE:
+        raise ValueError(f"Each rate test requires exactly {TRIALS_PER_RATE} trials.")
+    for field in ("group", "direction", "phase", "target_mbps"):
+        if any(sample[field] != samples[0][field] for sample in samples):
+            raise ValueError("Only trials from the same rate test can be combined.")
+    if len({sample["trial"] for sample in samples}) != TRIALS_PER_RATE:
+        raise ValueError("Each repetition must have a distinct trial ID.")
+    loss = median(sample["loss_percent"] for sample in samples)
+    representative = next(sample for sample in samples if sample["loss_percent"] == loss)
+    status = "PASS" if loss < LOSS_FAILURE_PERCENT else "LOSS"
+    if any(sample["status"] == "SENDER LIMITED" for sample in samples):
+        status = "SENDER LIMITED"
+    result = {key: value for key, value in representative.items() if key != "repetition"}
+    result.update(
+        loss_percent=loss,
+        status=status,
+        passed=status == "PASS",
+        aggregation="median_loss",
+        sample_count=TRIALS_PER_RATE,
+        sample_trials=[sample["trial"] for sample in samples],
+        representative_trial=representative["trial"],
+    )
+    return result

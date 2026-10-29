@@ -7,7 +7,7 @@ from dataclasses import replace
 import pytest
 
 from udp_probe.config import ProbeConfig
-from udp_probe.metrics import PacketTracker, RateSearch, evaluate_trial
+from udp_probe.metrics import PacketTracker, RateSearch, aggregate_trials, evaluate_trial
 from udp_probe.protocol import JsonChannel, ProtocolError
 from udp_probe.udp import HEADER, MAGIC, UdpEndpoint
 
@@ -125,6 +125,93 @@ def test_zero_packets_and_invalid_remote_metrics():
             1200,
             1,
         )
+
+
+def measurement(trial, loss_percent, sent=10000, errors=0):
+    result = evaluate_trial(
+        {"sent": sent, "elapsed": sent / 10000, "errors": errors},
+        report(round(sent * (1 - loss_percent / 100))),
+        96,
+        1200,
+        ProbeConfig().loss_limit,
+    )
+    return {
+        **result,
+        "trial": trial,
+        "group": 123,
+        "direction": "downlink",
+        "phase": "search",
+        "repetition": trial,
+        "repetitions": 3,
+    }
+
+
+@pytest.mark.parametrize(
+    ("losses", "expected", "status"),
+    [
+        ([0, 4.99, 100], 4.99, "PASS"),
+        ([100, 4.99, 0], 4.99, "PASS"),
+        ([0, 5, 100], 5, "LOSS"),
+        ([5.01, 0, 100], 5.01, "LOSS"),
+        ([4, 4, 100], 4, "PASS"),
+        ([0, 100, 100], 100, "LOSS"),
+    ],
+)
+def test_rate_test_uses_median_of_three_losses(losses, expected, status):
+    samples = [measurement(index, loss) for index, loss in enumerate(losses, 1)]
+    result = aggregate_trials(samples)
+    assert result["loss_percent"] == pytest.approx(expected)
+    assert result["status"] == status
+    assert result["passed"] == (status == "PASS")
+    assert result["sample_count"] == 3
+    assert result["aggregation"] == "median_loss"
+    assert result["sample_trials"] == [1, 2, 3]
+    assert "repetition" not in result
+    representative = next(sample for sample in samples if sample["loss_percent"] == expected)
+    assert result["representative_trial"] == result["trial"] == representative["trial"]
+    for field in ("offered_mbps", "goodput_mbps", "sent", "received", "elapsed", "jitter_ms"):
+        assert result[field] == representative[field]
+    assert all("repetition" in sample for sample in samples)
+
+
+def test_median_loss_is_not_pooled_or_weighted_by_packet_count():
+    samples = [measurement(1, 0), measurement(2, 4, sent=20000), measurement(3, 100, sent=100000)]
+    result = aggregate_trials(samples)
+    assert result["loss_percent"] == 4
+    assert result["passed"]
+    assert result["sent"] == 20000
+    assert result["elapsed"] == 2
+    assert result["goodput_mbps"] == pytest.approx(92.16)
+
+
+def test_all_three_senders_must_meet_pacing_and_error_requirements():
+    samples = [measurement(1, 0), measurement(2, 4), measurement(3, 100, errors=1)]
+    result = aggregate_trials(samples)
+    assert result["loss_percent"] == 4
+    assert result["status"] == "SENDER LIMITED"
+    assert not result["passed"]
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 4])
+def test_rate_test_rejects_incomplete_or_extra_repetitions(count):
+    with pytest.raises(ValueError, match="exactly 3"):
+        aggregate_trials([measurement(index, 0) for index in range(count)])
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("group", 456), ("direction", "uplink"), ("phase", "verify"), ("target_mbps", 1)],
+)
+def test_rate_test_rejects_unrelated_samples(field, value):
+    samples = [measurement(index, 0) for index in range(1, 4)]
+    samples[1][field] = value
+    with pytest.raises(ValueError, match="same rate test"):
+        aggregate_trials(samples)
+
+
+def test_rate_test_requires_distinct_trial_ids():
+    with pytest.raises(ValueError, match="distinct trial ID"):
+        aggregate_trials([measurement(1, 0)] * 3)
 
 
 def tcp_pair():

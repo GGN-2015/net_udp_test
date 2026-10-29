@@ -1,3 +1,4 @@
+import csv
 import json
 import os
 from pathlib import Path
@@ -37,6 +38,8 @@ def probe_app(gui_window, tmp_path):
     app.connected = False
     app.running = False
     app.records.clear()
+    app.samples.clear()
+    app.report = None
     app.table.delete(*app.table.get_children())
     app._buttons()
     app._chart()
@@ -59,11 +62,41 @@ def test_gui_controls_results_exports_and_layout(probe_app, tmp_path, monkeypatc
         "jitter_ms": 0.12,
         "status": "PASS",
         "passed": True,
+        "group": 123,
+        "sample_count": 3,
     }
+    samples = [
+        {
+            **{key: value for key, value in result.items() if key != "sample_count"},
+            "trial": index,
+            "repetition": index,
+            "repetitions": 3,
+            "loss_percent": loss,
+            "status": "PASS" if loss < 5 else "LOSS",
+            "passed": loss < 5,
+        }
+        for index, loss in enumerate((0.1, 0.38, 10), 1)
+    ]
+    app._event(
+        "trial",
+        {
+            "direction": "downlink",
+            "phase": "verify",
+            "rate": 80,
+            "duration": 3,
+            "repetition": 2,
+            "repetitions": 3,
+        },
+    )
+    assert "trial 2/3" in app.trial_status.get()
+    for sample in samples:
+        app._event("sample", sample)
+    assert app.records == []
     app._event("result", result)
     report = {
         "outcome": "completed",
         "records": [result],
+        "samples": samples,
         "recommendations": {"downlink": result},
         "config": {"mode": "auto"},
     }
@@ -71,6 +104,8 @@ def test_gui_controls_results_exports_and_layout(probe_app, tmp_path, monkeypatc
     assert app.downlink_value.get() == "80.00"
     assert "72.00" in app.summary.get()
     assert len(app.table.get_children()) == 1
+    assert app.table.heading("loss", "text") == "Median loss %"
+    assert "1 rate tests, 3 individual trials" in app.trial_status.get()
     for extension in ("json", "csv"):
         path = tmp_path / f"export.{extension}"
         monkeypatch.setattr(
@@ -80,9 +115,18 @@ def test_gui_controls_results_exports_and_layout(probe_app, tmp_path, monkeypatc
         app._export()
         assert path.is_file()
         if extension == "json":
-            assert json.loads(path.read_text())["outcome"] == "completed"
+            exported = json.loads(path.read_text())
+            assert exported["outcome"] == "completed"
+            assert exported["samples"] == samples
+            assert exported["records"] == [result]
         else:
-            assert "goodput_mbps" in path.read_text()
+            with path.open(newline="") as output:
+                rows = list(csv.DictReader(output))
+            assert len(rows) == 3
+            assert [float(row["loss_percent"]) for row in rows] == [0.1, 0.38, 10]
+            assert all(row["median_loss_percent"] == "0.38" for row in rows)
+            assert all(row["group_status"] == "PASS" for row in rows)
+            assert all(row["group_passed"] == "True" for row in rows)
     app.update()
     assert app.stop_button.winfo_ismapped()
     assert app.stop_button.winfo_rooty() + app.stop_button.winfo_height() <= (
@@ -100,6 +144,48 @@ def test_gui_controls_results_exports_and_layout(probe_app, tmp_path, monkeypatc
         )
     app._save_settings()
     assert (tmp_path / ".udp-rate-probe/settings.json").is_file()
+
+
+def test_partial_group_can_be_exported_without_a_median(probe_app, tmp_path, monkeypatch):
+    app = probe_app
+    app.running = True
+    app._event("running", {})
+    sample = {
+        "group": 123,
+        "trial": 1,
+        "direction": "downlink",
+        "target_mbps": 80,
+        "repetition": 1,
+        "repetitions": 3,
+        "loss_percent": 2,
+        "status": "PASS",
+    }
+    app._event("sample", sample)
+    assert str(app.export_button["state"]) == "disabled"
+    app._event(
+        "finished",
+        {
+            "outcome": "stopped",
+            "records": [],
+            "samples": [sample],
+            "recommendations": {},
+            "config": {"mode": "fixed"},
+        },
+    )
+    assert str(app.export_button["state"]) == "normal"
+    assert not app.table.get_children()
+    path = tmp_path / "partial.csv"
+    monkeypatch.setattr("udp_probe.gui.filedialog.asksaveasfilename", lambda **kwargs: str(path))
+    app._export()
+    with path.open(newline="") as output:
+        rows = list(csv.DictReader(output))
+    assert len(rows) == 1
+    assert rows[0]["loss_percent"] == "2"
+    for field in ("median_loss_percent", "group_status", "group_passed"):
+        assert rows[0][field] == ""
+    app._event("running", {})
+    assert app.samples == app.records == []
+    assert str(app.export_button["state"]) == "disabled"
 
 
 def test_chart_compares_actual_sent_and_received_across_directions(probe_app):

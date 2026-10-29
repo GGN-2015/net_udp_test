@@ -30,6 +30,7 @@ class ProbeApp(tk.Tk):
         self.probe_widgets = []
         self.connection_widgets = []
         self.records = []
+        self.samples = []
         self.report = None
         self.connected = False
         self.listening = False
@@ -131,7 +132,7 @@ class ProbeApp(tk.Tk):
             ("duration", "Trial duration (s)", "3", None),
             ("payload_size", "Datagram bytes", "1200", None),
             ("loss_limit", "Fail at loss (%)", f"{LOSS_FAILURE_PERCENT:g}", None),
-            ("max_steps", "Max search trials", "10", None),
+            ("max_steps", "Max search rate tests", "10", None),
             ("drain_ms", "Drain time (ms)", "400", None),
             ("tolerance", "Search tolerance", "0.05", None),
         ]
@@ -165,7 +166,10 @@ class ProbeApp(tk.Tk):
         self.stop_button.pack(fill="x")
         ttk.Label(
             controls,
-            text="Loss ≥ 5% fails.\nUse only on networks you own\nor have permission to test.",
+            text=(
+                "3 trials per rate; median loss ≥ 5% fails.\n"
+                "Use only on networks you own\nor have permission to test."
+            ),
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(12, 0))
 
@@ -187,7 +191,9 @@ class ProbeApp(tk.Tk):
 
         chart = ttk.Frame(right, style="Card.TFrame", padding=(12, 8))
         chart.pack(fill="x", pady=10)
-        ttk.Label(chart, text="Sent vs received rate (Mbps)", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            chart, text="Sent vs received rate (median-loss trial, Mbps)", style="Title.TLabel"
+        ).pack(anchor="w")
         self.canvas = tk.Canvas(chart, height=155, bg="white", highlightthickness=0)
         self.canvas.pack(fill="x")
         self.canvas.bind("<Configure>", lambda event: self._chart())
@@ -216,11 +222,11 @@ class ProbeApp(tk.Tk):
                 "Target",
                 "Sent Mbps",
                 "Rx Mbps",
-                "Loss %",
+                "Median loss %",
                 "Jitter ms",
                 "Result",
             ),
-            (77, 60, 66, 74, 74, 60, 68, 130),
+            (77, 60, 66, 74, 74, 95, 68, 130),
             strict=True,
         ):
             self.table.heading(name, text=title)
@@ -287,7 +293,7 @@ class ProbeApp(tk.Tk):
         )
         self.stop_button.configure(state="normal" if self.running else "disabled")
         self.export_button.configure(
-            state="normal" if self.records and not self.running else "disabled"
+            state="normal" if (self.records or self.samples) and not self.running else "disabled"
         )
         for widget in self.probe_widgets:
             widget.configure(
@@ -361,6 +367,7 @@ class ProbeApp(tk.Tk):
             self._log("Phone disconnected.")
         elif kind == "running":
             self.records.clear()
+            self.samples.clear()
             self.report = None
             self.table.delete(*self.table.get_children())
             self.downlink_value.set("—")
@@ -371,7 +378,15 @@ class ProbeApp(tk.Tk):
             self.current_trial = data
             self.trial_status.set(
                 f"{data['direction'].title()} · {data['phase']} · "
-                f"target {data['rate']:.2f} Mbps · {data['duration']:.1f} s"
+                f"target {data['rate']:.2f} Mbps · "
+                f"trial {data['repetition']}/{data['repetitions']} · {data['duration']:.1f} s"
+            )
+        elif kind == "sample":
+            self.samples.append(data)
+            self._log(
+                f"{data['direction']} {data['target_mbps']:.2f} Mbps "
+                f"trial {data['repetition']}/{data['repetitions']}: "
+                f"{data['status']}, loss {data['loss_percent']:.2f}%."
             )
         elif kind == "result":
             self.records.append(data)
@@ -394,13 +409,15 @@ class ProbeApp(tk.Tk):
             self._chart()
             self._log(
                 f"{data['direction']} {data['target_mbps']:.2f} Mbps: "
-                f"{data['status']}, loss {data['loss_percent']:.2f}%."
+                f"{data['status']}, median loss {data['loss_percent']:.2f}% "
+                f"({data['sample_count']} trials)."
             )
         elif kind == "finished":
             self.running = False
             self.report = data
             self.trial_status.set(
-                f"Probe {data['outcome']}. {len(data['records'])} trials recorded."
+                f"Probe {data['outcome']}. {len(data['records'])} rate tests, "
+                f"{len(data['samples'])} individual trials recorded."
             )
             notes = []
             if data["outcome"] == "completed":
@@ -419,7 +436,7 @@ class ProbeApp(tk.Tk):
                         variable.set("No pass")
                 self.summary.set(
                     ". ".join(notes)
-                    or "No confirmed auto-rate recommendation. Inspect trial results."
+                    or "No confirmed auto-rate recommendation. Inspect rate test results."
                 )
                 if data["config"]["mode"] == "fixed":
                     self.summary.set(
@@ -534,7 +551,7 @@ class ProbeApp(tk.Tk):
             right,
             height - 7,
             anchor="e",
-            text="Trial order →  D: downlink / U: uplink",
+            text="Rate test order →  D: downlink / U: uplink",
             fill=MUTED,
             font=("Segoe UI", 8),
         )
@@ -558,9 +575,21 @@ class ProbeApp(tk.Tk):
         try:
             with open(filename, "w", encoding="utf-8", newline="") as output:
                 if filename.lower().endswith(".csv"):
-                    writer = csv.DictWriter(output, fieldnames=list(self.records[0]))
+                    summaries = {record["group"]: record for record in self.records}
+                    rows = []
+                    for sample in self.samples:
+                        summary = summaries.get(sample["group"], {})
+                        rows.append(
+                            {
+                                **sample,
+                                "median_loss_percent": summary.get("loss_percent", ""),
+                                "group_status": summary.get("status", ""),
+                                "group_passed": summary.get("passed", ""),
+                            }
+                        )
+                    writer = csv.DictWriter(output, fieldnames=list(rows[0]))
                     writer.writeheader()
-                    writer.writerows(self.records)
+                    writer.writerows(rows)
                 else:
                     json.dump(self.report, output, indent=2, allow_nan=False)
             self._log(f"Exported {filename}")

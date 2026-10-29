@@ -1,6 +1,7 @@
 import socket
 import time
 from dataclasses import replace
+from statistics import median
 
 import pytest
 from conftest import free_port
@@ -30,6 +31,21 @@ def configuration(**changes):
     )
 
 
+def assert_complete_groups(report):
+    assert report["repetitions_per_rate"] == 3
+    assert len(report["samples"]) == len(report["records"]) * 3
+    assert len({sample["trial"] for sample in report["samples"]}) == len(report["samples"])
+    for record in report["records"]:
+        samples = [sample for sample in report["samples"] if sample["group"] == record["group"]]
+        assert [sample["repetition"] for sample in samples] == [1, 2, 3]
+        assert all(sample["repetitions"] == 3 for sample in samples)
+        assert record["sample_count"] == 3
+        assert record["sample_trials"] == [sample["trial"] for sample in samples]
+        assert record["loss_percent"] == median(sample["loss_percent"] for sample in samples)
+        for field in ("direction", "phase", "target_mbps"):
+            assert all(sample[field] == record[field] for sample in samples)
+
+
 def test_fixed_both_directions_and_repeat(host):
     server, events, port = host
     with PhonePeer(port):
@@ -41,6 +57,7 @@ def test_fixed_both_directions_and_repeat(host):
             assert result["outcome"] == "completed"
             assert [record["direction"] for record in result["records"]] == ["downlink", "uplink"]
             assert all(record["passed"] for record in result["records"])
+            assert_complete_groups(result)
 
 
 @pytest.mark.parametrize("from_phone", [False, True])
@@ -69,6 +86,49 @@ def test_auto_verifies_passing_candidate(host):
         assert result["outcome"] == "completed"
         assert result["records"][-1]["phase"] == "verify"
         assert result["recommendations"]["downlink"]["passed"]
+        assert_complete_groups(result)
+
+
+def test_auto_uses_median_instead_of_last_trial_for_search_and_verification(host, monkeypatch):
+    original_snapshot = UdpEndpoint.snapshot
+    snapshots = 0
+
+    def snapshot_with_one_outlier(endpoint):
+        nonlocal snapshots
+        snapshot = original_snapshot(endpoint)
+        snapshots += 1
+        if snapshots % 3 == 0:
+            snapshot["received"] = 0
+        return snapshot
+
+    monkeypatch.setattr(UdpEndpoint, "snapshot", snapshot_with_one_outlier)
+    server, events, port = host
+    with PhonePeer(port):
+        events.wait("connected")
+        server.start_probe(replace(configuration(), mode="auto", direction="downlink", max_steps=2))
+        result = events.wait("finished")
+        assert result["outcome"] == "completed"
+        assert_complete_groups(result)
+        assert [record["target_mbps"] for record in result["records"]] == [0.5, 1, 1]
+        assert [record["phase"] for record in result["records"]] == ["search", "search", "verify"]
+        assert all(record["passed"] for record in result["records"])
+        assert all(sample["loss_percent"] == 100 for sample in result["samples"][2::3])
+        assert result["recommendations"]["downlink"]["target_mbps"] == 1
+
+
+def test_stop_retains_completed_samples_without_evaluating_incomplete_group(host):
+    server, events, port = host
+    with PhonePeer(port):
+        events.wait("connected")
+        server.start_probe(replace(configuration(), direction="downlink"))
+        sample = events.wait("sample")
+        server.stop_probe()
+        result = events.wait("finished")
+        assert result["outcome"] == "stopped"
+        assert result["samples"][0] == sample
+        assert 1 <= len(result["samples"]) < 3
+        assert result["records"] == []
+        assert result["recommendations"] == {}
 
 
 def test_auto_rejects_five_percent_or_higher_loss(host, monkeypatch):
@@ -89,6 +149,7 @@ def test_auto_rejects_five_percent_or_higher_loss(host, monkeypatch):
         assert result["config"]["loss_limit"] == phone.config["loss_limit"] == 5
         assert result["recommendations"] == {"downlink": None, "uplink": None}
         assert len(result["records"]) == 2
+        assert_complete_groups(result)
         for record in result["records"]:
             assert record["loss_percent"] >= 5
             assert record["status"] == "LOSS"

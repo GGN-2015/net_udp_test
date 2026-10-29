@@ -2,6 +2,7 @@ from dataclasses import asdict, dataclass
 from math import isfinite
 
 LOSS_FAILURE_PERCENT = 5.0
+TRIALS_PER_RATE = 3
 
 
 @dataclass(frozen=True)

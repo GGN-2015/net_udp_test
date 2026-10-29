@@ -11,8 +11,10 @@ threads, so both interfaces remain responsive.
 ## Features
 
 - **Automatic rate search:** increase the offered rate, bracket failure, bisect
-  the interval, then verify a passing candidate with a longer trial.
+  the interval, then verify a passing candidate with longer trials.
 - **Fixed-rate mode:** measure a selected rate without searching.
+- **Three-trial median:** test every rate three times and use the median packet
+  loss for the search, fixed-rate result, and verification decision.
 - **Downlink and uplink:** host → phone, phone → host, or both sequentially.
 - **Measured results:** actual offered rate, received goodput, loss, duplicate
   packets, reordering, interarrival jitter, and sender errors.
@@ -20,7 +22,7 @@ threads, so both interfaces remain responsive.
   than mistaken for a passing high-rate link.
 - **Desktop dashboard:** actual sent and valid received rate curves, results
   table, confirmed rates, suggested 10% headroom, JSON/CSV export, and saved settings.
-- **Loss failure rule:** a trial fails at **5% or greater** packet loss.
+- **Loss failure rule:** a rate test fails at **5% or greater** median packet loss.
 - **Connection lifecycle:** heartbeat, peer/version checks, cancellation from
   either endpoint, disconnect handling, and repeated runs on one TCP connection.
 
@@ -119,8 +121,9 @@ own signing configuration; no private signing keys are included.
    (`5003`), direction, rates, and trial duration. The loss failure threshold is
    fixed at **5%**.
 5. Click **Start probe** on the desktop. Keep the Android app visible. Both
-   endpoints show results after each trial. **Stop probe** on either endpoint
-   cancels the run and leaves TCP connected for another run.
+   endpoints show the median result after each group of three trials. The
+   desktop shows the current repetition and logs each trial's loss. **Stop probe**
+   on either endpoint cancels the run and leaves TCP connected for another run.
 6. Read the confirmed rate cards after an automatic run. Use **Export results**
    for the full JSON report or a CSV of individual trials.
 
@@ -141,12 +144,12 @@ Only one phone is accepted at a time.
 | TCP port | 5001 | Host control listener; match this on the phone |
 | Host / phone UDP port | 5002 / 5003 | Each endpoint's UDP bind and peer destination |
 | Direction | both | Downlink, then uplink, using separate searches |
-| Probe mode | auto | Automatic search or one fixed-rate trial per direction |
+| Probe mode | auto | Automatic search or one three-trial fixed-rate test per direction |
 | Minimum / start / maximum | 1 / 10 / 200 Mbps | Search bounds; start is also the fixed-mode target |
-| Trial duration | 3 seconds | Each search or fixed-rate measurement |
+| Trial duration | 3 seconds | Duration of each of the three search or fixed-rate trials |
 | Datagram bytes | 1200 | Total UDP payload, including the 36-byte probe header |
-| Fail at loss | 5% (fixed) | Packet loss at or above this value fails the trial |
-| Max search trials | 10 | Search budget per direction, excluding verification |
+| Fail at loss | 5% (fixed) | Median packet loss at or above this value fails the rate test |
+| Max search rate tests | 10 | Rate groups per direction; three trials each, excluding verification |
 | Drain time | 400 ms | Receive grace period after the sender finishes |
 | Search tolerance | 0.05 | Stop when the pass/fail interval is within 5% |
 
@@ -163,20 +166,33 @@ loss thresholds are ignored; the host always uses the fixed 5% failure threshold
 
 For each selected direction:
 
-1. Test the start rate. Double after passing trials until a failure or the
+1. Test the start rate three times. Double after passing rate tests until a failure or the
    configured maximum; halve after failures until a passing rate or the minimum.
 2. Once both a passing and failing bound exist, bisect until the interval is
-   within the configured tolerance or the search budget is exhausted.
-3. Re-test the highest passing candidate for
-   `min(30, max(3, trial_duration * 1.5))` seconds. If it fails, try up to two
+   within the configured tolerance or the search budget is exhausted. Every
+   candidate gets three independent trials before the search advances.
+3. Re-test the highest passing candidate with three trials, each lasting
+   `min(30, max(3, trial_duration * 1.5))` seconds. If its median fails, try up to two
    lower previously passing candidates. Only a passing verification produces a
    confirmed recommendation. Otherwise the GUI shows **No pass**.
 
-A trial passes when it receives at least one unique packet, loss is **strictly
-below 5%**, there are no socket send errors, and the actual offered
-rate is within 10% of the target (or one packet's rate, whichever is larger, to
-handle low-rate quantization). A target that the sender cannot pace is marked
-`SENDER LIMITED` and treated as a failing bound.
+For each rate test, compute the loss percentage separately for each trial, sort
+the three percentages, and take the middle value. **Median loss strictly below
+5% passes the loss criterion; 5% or higher fails.** For example, losses of
+`0%, 4%, 20%` give a median of `4%`; `0%, 5%, 20%` give `5%` and fail. This is
+the median of three percentages, not their average or pooled packet counts.
+
+All three trials must also have no socket send errors and an actual offered
+rate within 10% of the target (or one packet's rate, whichever is larger, to
+handle low-rate quantization). If any sender cannot meet this requirement, the
+rate test is marked `SENDER LIMITED` and treated as a failing bound. A trial with
+no sent packets or no received packets has 100% loss.
+
+Fixed mode uses the same three-trial decision without searching. The trial
+duration applies to each repetition: a 3-second rate test sends for 9 seconds
+in total, plus drain and control overhead. The search budget counts complete
+rate tests, so a budget of 10 permits up to 30 search trials per direction;
+verification is additional.
 
 Rates use decimal Mbps and count UDP payload bytes, including the probe header:
 
@@ -184,16 +200,35 @@ Rates use decimal Mbps and count UDP payload bytes, including the probe header:
 offered Mbps = sent_packets * datagram_bytes * 8 / actual_sender_seconds / 1e6
 goodput Mbps = unique_received_packets * datagram_bytes * 8 / actual_sender_seconds / 1e6
 loss %       = (sent_packets - unique_received_packets) / sent_packets * 100
+median loss % = median(loss_trial_1, loss_trial_2, loss_trial_3)
 ```
 
-The desktop chart shows two curves against trial order: **Sent (actual)** is the
+The desktop chart shows two curves against rate-test order: **Sent (actual)** is the
 measured sender rate, and **Received (valid)** is the unique accepted-packet rate.
-Both use the same sender duration and shared Mbps axis. The sent curve is blue
+Each point represents one complete group of three trials. Both rates and the
+displayed packet counters, duration, and jitter come from the actual trial with
+the median loss. Ties use the first matching trial. Keeping both rates from the
+same trial preserves their relationship to the median loss.
+
+Both curves use that trial's sender duration and a shared Mbps axis. The sent curve is blue
 and solid; the received curve is green and dashed. Red crosses mark failed
-received samples. Trial labels use `D` for downlink and `U` for uplink; colors
-always identify sent versus received, regardless of direction. Exactly 5% loss
-fails, while 4.99% satisfies the loss criterion. Each point is a completed trial
-average, not a live per-second sample.
+rate tests. Labels use `D` for downlink and `U` for uplink; colors always identify
+sent versus received, regardless of direction. These are trial averages, not
+live per-second samples.
+
+### Exported results
+
+- **JSON:** `records` contains completed three-trial summaries, `samples` contains
+  every completed individual trial, and `repetitions_per_rate` is `3`.
+- **Rate-test summary:** `loss_percent` is the median; `sample_trials` lists the
+  three trial IDs, and `representative_trial` identifies the plotted trial.
+  `aggregation` is `median_loss`, and `sample_count` is `3`.
+- **CSV:** one row per individual trial, retaining its own `loss_percent` and
+  rates. `median_loss_percent`, `group_status`, and `group_passed` add the
+  completed group's decision. `group` links repetitions to their summary.
+- **Stopped runs:** completed trials remain exportable even if their group has
+  fewer than three samples. Such groups get no summary or search decision, and
+  their CSV median and group-decision columns remain empty.
 
 Sequence numbers deduplicate packets and identify reordering. Jitter is an
 exponentially smoothed interarrival transit variation (`1/16` update), computed
@@ -262,10 +297,11 @@ sh gradlew assembleDebug lintDebug
 
 On Windows use `gradlew.bat` in place of `sh gradlew`.
 
-Tests cover configuration, search convergence, rate classification, loss,
-duplicates/reordering, control framing, actual loopback UDP traffic, both
-directions, repeated runs, stop/restart, reconnect, version rejection, and port
-conflicts. Tests bind only loopback addresses.
+Tests cover configuration, search convergence, three-trial grouping, median-loss
+boundaries and outliers, paired chart data, raw-trial exports, incomplete groups,
+rate classification, loss, duplicates/reordering, control framing, actual loopback
+UDP traffic, both directions, repeated runs, stop/restart, reconnect, version
+rejection, and port conflicts. Tests bind only loopback addresses.
 
 Optional JVM interoperability tests compile and run the **actual Android TCP
 client and UDP engine** against the Python host. Supply a Java 17+ JDK and an
