@@ -27,6 +27,8 @@ threads, so both interfaces remain responsive.
 
 ```text
 pyproject.toml              Python package and desktop entry point
+uv.lock                     Locked Python dependencies for reproducible environments
+.python-version             Default project interpreter (Python 3.12)
 src/udp_probe/             Desktop GUI, controller, UDP engine, and metrics
 android/                   Android Studio / Gradle APK project and wrapper
 tests/                     Unit, real-socket, and optional Java interop tests
@@ -35,44 +37,39 @@ docs/PROTOCOL.md            TCP messages and UDP wire format
 
 ## 1. Run the desktop host
 
-Requires **Python 3.10+ with Tkinter**. The application uses only the Python
-standard library and has no runtime pip dependencies.
+Requires **Python 3.10+ with Tkinter** and [uv](https://docs.astral.sh/uv/).
+The application has no runtime Python dependencies; uv manages the project
+environment, development tools, and lockfile. The default project interpreter
+is Python 3.12, selected by `.python-version`.
 
 ### Windows (PowerShell)
 
-Install Python with its **Tcl/Tk and IDLE** component enabled, then run from the
-repository root:
+Install uv and the project interpreter with `uv python install 3.12`, then run
+from the repository root:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e .
-.\.venv\Scripts\udp-rate-probe.exe
+uv python install 3.12
+uv sync
+uv run udp-rate-probe
 ```
 
 ### Linux
 
-Install your distribution's Tkinter package first. On Ubuntu/Debian:
+Install uv, then run from the repository root:
 
 ```bash
-sudo apt install python3-tk python3-venv
-python3 -m venv .venv
-.venv/bin/python -m pip install -e .
-.venv/bin/udp-rate-probe
+uv python install 3.12
+uv sync
+uv run udp-rate-probe
 ```
 
-Fedora uses `python3-tkinter`. A graphical desktop/X11/Wayland session is required.
+A graphical desktop/X11/Wayland session is required. If using a system Python
+instead, install its matching Tkinter package (`python3-tk` on Ubuntu/Debian or
+`python3-tkinter` on Fedora), then select it with
+`uv sync --python /path/to/python3.12`.
 
-After installation, `python -m udp_probe` is an alternative launch command.
-To run directly from the source tree without installing:
-
-```powershell
-$env:PYTHONPATH = "src"
-python -m udp_probe
-```
-
-```bash
-PYTHONPATH=src python3 -m udp_probe
-```
+After synchronization, `uv run python -m udp_probe` is an alternative launch
+command. `uv run` uses the editable project environment created by `uv sync`.
 
 ## 2. Build and install the Android app
 
@@ -239,11 +236,14 @@ required during measurement.
 
 ## Development and verification
 
+The `dev` dependency group is installed by default. Commit `uv.lock` alongside
+dependency changes; use `uv sync --locked` to require the checked-in resolution.
+
 ```bash
-python -m pip install -e ".[dev]"
-python -m pytest -q
-python -m ruff check src tests
-python -m ruff format --check src tests
+uv sync
+uv run pytest -q
+uv run ruff check src tests
+uv run ruff format --check src tests
 cd android
 sh gradlew assembleDebug lintDebug
 ```
@@ -264,7 +264,7 @@ Java classes. Without that environment variable these tests are skipped.
 
 ```powershell
 $env:UDP_PROBE_JSON_JAR = "C:\path\to\json-20240303.jar"
-python -m pytest -q
+uv run pytest -q
 ```
 
 Android compilation/lint and JVM interoperability validate the implementation;
