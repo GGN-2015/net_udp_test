@@ -23,6 +23,8 @@ from udp_probe.udp import HEADER, MAGIC, UdpEndpoint
         {"max_mbps": math.inf},
         {"min_mbps": 20},
         {"loss_limit": -1},
+        {"loss_limit": 1},
+        {"loss_limit": 20},
         {"max_steps": 0},
         {"direction": "invalid"},
         {"mode": "invalid"},
@@ -80,12 +82,33 @@ def report(received=100):
 
 def test_measurement_distinguishes_loss_and_sender_limit():
     sender = {"sent": 100, "elapsed": 1, "errors": 0}
-    assert evaluate_trial(sender, report(), 0.96, 1200, 1)["status"] == "PASS"
-    assert evaluate_trial(sender, report(98), 0.96, 1200, 1)["status"] == "LOSS"
-    limited = evaluate_trial(sender, report(), 10, 1200, 1)
+    threshold = ProbeConfig().loss_limit
+    assert threshold == 5
+    assert evaluate_trial(sender, report(), 0.96, 1200, threshold)["status"] == "PASS"
+    assert evaluate_trial(sender, report(94), 0.96, 1200, threshold)["status"] == "LOSS"
+    limited = evaluate_trial(sender, report(), 10, 1200, threshold)
     assert limited["status"] == "SENDER LIMITED"
     assert limited["goodput_mbps"] == 0.96
-    assert evaluate_trial(sender, report(99), 0.96, 1200, 1)["passed"]
+    assert evaluate_trial(sender, report(96), 0.96, 1200, threshold)["passed"]
+
+
+@pytest.mark.parametrize(
+    ("received", "expected_status"),
+    [(10000, "PASS"), (9501, "PASS"), (9500, "LOSS"), (9499, "LOSS"), (0, "LOSS")],
+    ids=["no-loss", "4.99-percent", "5-percent", "5.01-percent", "total-loss"],
+)
+def test_loss_at_or_above_five_percent_fails(received, expected_status):
+    result = evaluate_trial(
+        {"sent": 10000, "elapsed": 1, "errors": 0},
+        report(received),
+        96,
+        1200,
+        ProbeConfig().loss_limit,
+    )
+    assert result["status"] == expected_status
+    assert result["passed"] == (expected_status == "PASS")
+    assert result["offered_mbps"] == 96
+    assert result["goodput_mbps"] == received * 1200 * 8 / 1_000_000
 
 
 def test_zero_packets_and_invalid_remote_metrics():

@@ -88,7 +88,7 @@ def evaluate_trial(sender, receiver, target_mbps, payload_size, loss_limit):
     goodput = received * payload_size * 8 / elapsed / 1_000_000
     quantization = payload_size * 8 / elapsed / 1_000_000
     pacing_ok = abs(offered - target_mbps) <= max(target_mbps * 0.1, quantization) and errors == 0
-    status = "PASS" if received and loss <= loss_limit and pacing_ok else "LOSS"
+    status = "PASS" if received and loss < loss_limit and pacing_ok else "LOSS"
     if not pacing_ok:
         status = "SENDER LIMITED"
     return {

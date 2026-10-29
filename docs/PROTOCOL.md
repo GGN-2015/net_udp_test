@@ -71,6 +71,12 @@ so loss is not estimated from how many packets were planned.
 Statuses are `PASS`, `LOSS`, and `SENDER LIMITED`. Phases are `search`, `verify`,
 and `fixed`. See the README for formulas and search/verification rules.
 
+The host fixes `loss_limit` at `5.0` in `configure` and evaluates loss strictly:
+`loss_percent < 5.0` satisfies the loss criterion, while `loss_percent >= 5.0`
+fails. The field remains in the existing configuration message for compatibility
+with the Android client. The host chart compares `offered_mbps` (actual sent)
+with `goodput_mbps` (unique valid received), using the same trial duration.
+
 ## UDP wire format
 
 Each UDP payload is exactly the configured `payload_size` bytes. The first

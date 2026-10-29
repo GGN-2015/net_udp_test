@@ -18,8 +18,9 @@ threads, so both interfaces remain responsive.
   packets, reordering, interarrival jitter, and sender errors.
 - **Honest pacing results:** a slow sender is reported as `SENDER LIMITED` rather
   than mistaken for a passing high-rate link.
-- **Desktop dashboard:** trial chart, results table, confirmed rates, suggested
-  10% headroom, JSON/CSV export, and saved settings.
+- **Desktop dashboard:** actual sent and valid received rate curves, results
+  table, confirmed rates, suggested 10% headroom, JSON/CSV export, and saved settings.
+- **Loss failure rule:** a trial fails at **5% or greater** packet loss.
 - **Connection lifecycle:** heartbeat, peer/version checks, cancellation from
   either endpoint, disconnect handling, and repeated runs on one TCP connection.
 
@@ -115,7 +116,8 @@ own signing configuration; no private signing keys are included.
    TCP port. Click **Connect**. The desktop displays the connected phone.
    `0.0.0.0` is a bind address; do not enter it on the phone.
 4. On the desktop, configure **Host UDP port** (`5002`) and **Phone UDP port**
-   (`5003`), direction, rates, trial duration, and acceptable loss.
+   (`5003`), direction, rates, and trial duration. The loss failure threshold is
+   fixed at **5%**.
 5. Click **Start probe** on the desktop. Keep the Android app visible. Both
    endpoints show results after each trial. **Stop probe** on either endpoint
    cancels the run and leaves TCP connected for another run.
@@ -143,18 +145,19 @@ Only one phone is accepted at a time.
 | Minimum / start / maximum | 1 / 10 / 200 Mbps | Search bounds; start is also the fixed-mode target |
 | Trial duration | 3 seconds | Each search or fixed-rate measurement |
 | Datagram bytes | 1200 | Total UDP payload, including the 36-byte probe header |
-| Allowed loss | 1% | Maximum lost unique packets for a passing trial |
+| Fail at loss | 5% (fixed) | Packet loss at or above this value fails the trial |
 | Max search trials | 10 | Search budget per direction, excluding verification |
 | Drain time | 400 ms | Receive grace period after the sender finishes |
 | Search tolerance | 0.05 | Stop when the pass/fail interval is within 5% |
 
 Ports must be 1024–65535. Rates must satisfy
 `0.01 <= minimum <= start <= maximum <= 1000 Mbps`; duration is 0.5–30 seconds,
-datagram size 128–1400 bytes, loss 0–20%, drain time 100–3000 ms, search budget
+datagram size 128–1400 bytes, drain time 100–3000 ms, search budget
 1–30, and tolerance 0.01–0.25. A requested rate is a target, not a guarantee.
 
 Desktop settings are stored in `~/.udp-rate-probe/settings.json`. The Android app
-remembers the last host and TCP port in private preferences.
+remembers the last host and TCP port in private preferences. Previously saved
+loss thresholds are ignored; the host always uses the fixed 5% failure threshold.
 
 ## How the best rate is determined
 
@@ -169,8 +172,8 @@ For each selected direction:
    lower previously passing candidates. Only a passing verification produces a
    confirmed recommendation. Otherwise the GUI shows **No pass**.
 
-A trial passes when it receives at least one unique packet, loss is within the
-configured threshold, there are no socket send errors, and the actual offered
+A trial passes when it receives at least one unique packet, loss is **strictly
+below 5%**, there are no socket send errors, and the actual offered
 rate is within 10% of the target (or one packet's rate, whichever is larger, to
 handle low-rate quantization). A target that the sender cannot pace is marked
 `SENDER LIMITED` and treated as a failing bound.
@@ -182,6 +185,15 @@ offered Mbps = sent_packets * datagram_bytes * 8 / actual_sender_seconds / 1e6
 goodput Mbps = unique_received_packets * datagram_bytes * 8 / actual_sender_seconds / 1e6
 loss %       = (sent_packets - unique_received_packets) / sent_packets * 100
 ```
+
+The desktop chart shows two curves against trial order: **Sent (actual)** is the
+measured sender rate, and **Received (valid)** is the unique accepted-packet rate.
+Both use the same sender duration and shared Mbps axis. The sent curve is blue
+and solid; the received curve is green and dashed. Red crosses mark failed
+received samples. Trial labels use `D` for downlink and `U` for uplink; colors
+always identify sent versus received, regardless of direction. Exactly 5% loss
+fails, while 4.99% satisfies the loss criterion. Each point is a completed trial
+average, not a live per-second sample.
 
 Sequence numbers deduplicate packets and identify reordering. Jitter is an
 exponentially smoothed interarrival transit variation (`1/16` update), computed

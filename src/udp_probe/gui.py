@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from .config import ProbeConfig
+from .config import LOSS_FAILURE_PERCENT, ProbeConfig
 from .host import HostServer
 
 BLUE = "#2563eb"
@@ -130,7 +130,7 @@ class ProbeApp(tk.Tk):
             ("max_mbps", "Maximum (Mbps)", "200", None),
             ("duration", "Trial duration (s)", "3", None),
             ("payload_size", "Datagram bytes", "1200", None),
-            ("loss_limit", "Allowed loss (%)", "1", None),
+            ("loss_limit", "Fail at loss (%)", f"{LOSS_FAILURE_PERCENT:g}", None),
             ("max_steps", "Max search trials", "10", None),
             ("drain_ms", "Drain time (ms)", "400", None),
             ("tolerance", "Search tolerance", "0.05", None),
@@ -147,7 +147,11 @@ class ProbeApp(tk.Tk):
             else:
                 widget = ttk.Entry(settings, textvariable=variable, width=13)
             widget.grid(row=row, column=1, sticky="ew", pady=4)
-            self.probe_widgets.append(widget)
+            if name == "loss_limit":
+                widget.configure(state="readonly")
+                self.loss_threshold_entry = widget
+            else:
+                self.probe_widgets.append(widget)
         ttk.Label(
             settings,
             text="Downlink: host → phone\nUplink: phone → host\nBoth: sequential, not simultaneous",
@@ -161,7 +165,7 @@ class ProbeApp(tk.Tk):
         self.stop_button.pack(fill="x")
         ttk.Label(
             controls,
-            text="Use only on networks you own\nor have permission to test.",
+            text="Loss ≥ 5% fails.\nUse only on networks you own\nor have permission to test.",
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(12, 0))
 
@@ -183,7 +187,7 @@ class ProbeApp(tk.Tk):
 
         chart = ttk.Frame(right, style="Card.TFrame", padding=(12, 8))
         chart.pack(fill="x", pady=10)
-        ttk.Label(chart, text="Received goodput by trial", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(chart, text="Sent vs received rate (Mbps)", style="Title.TLabel").pack(anchor="w")
         self.canvas = tk.Canvas(chart, height=155, bg="white", highlightthickness=0)
         self.canvas.pack(fill="x")
         self.canvas.bind("<Configure>", lambda event: self._chart())
@@ -434,8 +438,18 @@ class ProbeApp(tk.Tk):
         self.canvas.delete("all")
         width = max(self.canvas.winfo_width(), 250)
         height = 155
-        left, top, bottom, right = 48, 22, height - 24, width - 12
-        maximum = max((record["goodput_mbps"] for record in self.records), default=1) * 1.15
+        left, top, bottom, right = 48, 22, height - 40, width - 12
+        maximum = (
+            max(
+                (
+                    record[field]
+                    for record in self.records
+                    for field in ("offered_mbps", "goodput_mbps")
+                ),
+                default=1,
+            )
+            * 1.15
+        )
         maximum = max(maximum, 0.1)
         for tick in range(4):
             vertical = bottom - (bottom - top) * tick / 3
@@ -447,41 +461,82 @@ class ProbeApp(tk.Tk):
                 text=f"{maximum * tick / 3:.1f}",
                 fill=MUTED,
                 font=("Segoe UI", 8),
+                tags=("rate-axis-label",),
             )
         if not self.records:
             self.canvas.create_text(width / 2, 75, text="Measurements appear here", fill=MUTED)
-        points = {"downlink": [], "uplink": []}
-        for index, record in enumerate(self.records):
-            horizontal = left + (right - left) * index / max(1, len(self.records) - 1)
-            vertical = bottom - (bottom - top) * record["goodput_mbps"] / maximum
-            points[record["direction"]].extend((horizontal, vertical))
-            color = BLUE if record["direction"] == "downlink" else GREEN
-            self.canvas.create_oval(
-                horizontal - 3,
-                vertical - 3,
-                horizontal + 3,
-                vertical + 3,
-                fill=color if record["passed"] else "#dc2626",
-                outline="",
-            )
-        for direction, coordinates in points.items():
+        for tag, field, color in (
+            ("sent-rate", "offered_mbps", BLUE),
+            ("received-rate", "goodput_mbps", GREEN),
+        ):
+            coordinates = []
+            for index, record in enumerate(self.records):
+                horizontal = left + (right - left) * index / max(1, len(self.records) - 1)
+                vertical = bottom - (bottom - top) * record[field] / maximum
+                coordinates.extend((horizontal, vertical))
             if len(coordinates) >= 4:
                 self.canvas.create_line(
-                    *coordinates, fill=BLUE if direction == "downlink" else GREEN, width=2
+                    *coordinates,
+                    fill=color,
+                    width=2,
+                    dash=(5, 3) if field == "goodput_mbps" else (),
+                    tags=(tag,),
                 )
+            for index, record in enumerate(self.records):
+                horizontal, vertical = coordinates[index * 2 : index * 2 + 2]
+                self.canvas.create_oval(
+                    horizontal - 3,
+                    vertical - 3,
+                    horizontal + 3,
+                    vertical + 3,
+                    fill=color,
+                    outline="white",
+                    tags=(f"{tag}-sample",),
+                )
+                if field == "goodput_mbps" and not record["passed"]:
+                    for offset in (-5, 5):
+                        self.canvas.create_line(
+                            horizontal - 5,
+                            vertical - offset,
+                            horizontal + 5,
+                            vertical + offset,
+                            fill="#dc2626",
+                            width=2,
+                            tags=("failed-trial",),
+                        )
         self.canvas.create_text(
-            left, 8, anchor="w", text="Downlink", fill=BLUE, font=("Segoe UI", 8)
+            left, 8, anchor="w", text="Sent (actual)", fill=BLUE, font=("Segoe UI", 8)
         )
         self.canvas.create_text(
-            left + 70,
+            left + 100,
             8,
             anchor="w",
-            text="Uplink  ·  Red dot: failed",
+            text="Received (valid)",
             fill=GREEN,
             font=("Segoe UI", 8),
         )
         self.canvas.create_text(
-            right, height - 7, anchor="e", text="Trial order →", fill=MUTED, font=("Segoe UI", 8)
+            left + 225, 8, anchor="w", text="× Failed", fill="#dc2626", font=("Segoe UI", 8)
+        )
+        tick_step = max(1, (len(self.records) + 7) // 8)
+        for index in range(0, len(self.records), tick_step):
+            horizontal = left + (right - left) * index / max(1, len(self.records) - 1)
+            direction = "D" if self.records[index]["direction"] == "downlink" else "U"
+            self.canvas.create_text(
+                horizontal,
+                bottom + 10,
+                text=f"{index + 1}{direction}",
+                fill=MUTED,
+                font=("Segoe UI", 8),
+                tags=("trial-axis-label",),
+            )
+        self.canvas.create_text(
+            right,
+            height - 7,
+            anchor="e",
+            text="Trial order →  D: downlink / U: uplink",
+            fill=MUTED,
+            font=("Segoe UI", 8),
         )
 
     def _log(self, message):
@@ -516,7 +571,7 @@ class ProbeApp(tk.Tk):
         try:
             settings = json.loads(self.settings_path.read_text(encoding="utf-8"))
             for name, variable in self.variables.items():
-                if name in settings:
+                if name in settings and name != "loss_limit":
                     variable.set(str(settings[name]))
         except (OSError, ValueError, TypeError):
             pass

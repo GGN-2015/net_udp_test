@@ -8,6 +8,7 @@ from phone_peer import PhonePeer
 
 from udp_probe.config import ProbeConfig
 from udp_probe.protocol import JsonChannel
+from udp_probe.udp import UdpEndpoint
 
 
 def configuration(**changes):
@@ -68,6 +69,30 @@ def test_auto_verifies_passing_candidate(host):
         assert result["outcome"] == "completed"
         assert result["records"][-1]["phase"] == "verify"
         assert result["recommendations"]["downlink"]["passed"]
+
+
+def test_auto_rejects_five_percent_or_higher_loss(host, monkeypatch):
+    original_snapshot = UdpEndpoint.snapshot
+
+    def snapshot_with_loss(endpoint):
+        snapshot = original_snapshot(endpoint)
+        snapshot["received"] = snapshot["received"] * 95 // 100
+        return snapshot
+
+    monkeypatch.setattr(UdpEndpoint, "snapshot", snapshot_with_loss)
+    server, events, port = host
+    with PhonePeer(port) as phone:
+        events.wait("connected")
+        server.start_probe(replace(configuration(), mode="auto", max_steps=1))
+        result = events.wait("finished")
+        assert result["outcome"] == "completed"
+        assert result["config"]["loss_limit"] == phone.config["loss_limit"] == 5
+        assert result["recommendations"] == {"downlink": None, "uplink": None}
+        assert len(result["records"]) == 2
+        for record in result["records"]:
+            assert record["loss_percent"] >= 5
+            assert record["status"] == "LOSS"
+            assert not record["passed"]
 
 
 def test_disconnect_during_trial_and_reconnect(host):

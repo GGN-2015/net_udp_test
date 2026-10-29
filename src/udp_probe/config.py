@@ -1,6 +1,8 @@
 from dataclasses import asdict, dataclass
 from math import isfinite
 
+LOSS_FAILURE_PERCENT = 5.0
+
 
 @dataclass(frozen=True)
 class ProbeConfig:
@@ -13,7 +15,7 @@ class ProbeConfig:
     max_mbps: float = 200.0
     duration: float = 3.0
     payload_size: int = 1200
-    loss_limit: float = 1.0
+    loss_limit: float = LOSS_FAILURE_PERCENT
     max_steps: int = 10
     drain_ms: int = 400
     tolerance: float = 0.05
@@ -43,8 +45,10 @@ class ProbeConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not lower <= value <= upper:
                 raise ValueError(f"{name} must be an integer between {lower} and {upper}.")
-        if not 0 <= self.loss_limit <= 20 or not 0.01 <= self.tolerance <= 0.25:
-            raise ValueError("Loss must be 0-20 percent; search tolerance must be 0.01-0.25.")
+        if self.loss_limit != LOSS_FAILURE_PERCENT:
+            raise ValueError("The loss failure threshold is fixed at 5 percent.")
+        if not 0.01 <= self.tolerance <= 0.25:
+            raise ValueError("Search tolerance must be 0.01-0.25.")
         if self.direction not in {"downlink", "uplink", "both"}:
             raise ValueError("Invalid direction.")
         if self.mode not in {"auto", "fixed"}:
